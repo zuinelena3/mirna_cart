@@ -1,0 +1,275 @@
+---
+title: "CAR-T microRNA"
+author: "Elena Zuin"
+date: "2024-02-13"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, error=FALSE, message=FALSE)
+```
+
+```{r}
+library(readxl)
+library(tidyr)
+library(glmnet)
+library(MASS)
+library(survminer)
+library(survival)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(survminer)
+library(caret)
+library(corrplot)
+library(tibble)
+
+# Modify patient ID
+patient_id <- function(pid) {
+  m <- str_match(pid, "^CAR-(\\d+)$")
+  n <- as.integer(m[,2])
+  ifelse(!is.na(n),
+         paste("CAR", n, sep = "-"),
+         NA_character_)
+}
+
+# load miRNA normalized expression
+cart_mat <- read_xlsx("CAR_T_microRNA_expr_matrix.xlsx",
+               sheet = "Normalizedcounts_deseq2"
+               #sheet = "Raw_data"
+)
+cart_mat$miRNA <- gsub("-", "_", cart_mat$miRNA)
+cart_mat$miRNA <- gsub("/", "_", cart_mat$miRNA)
+
+cart_id <- patient_id(colnames(cart_mat))
+cart_id <- c(colnames(cart_mat)[1], cart_id[-1])
+colnames(cart_mat) <- cart_id
+
+cart_mat <- as.data.frame(cart_mat)
+rownames(cart_mat) <- cart_mat$miRNA
+cart_mat$miRNA <- NULL
+
+# micro-RNA filtering
+# Every microRNA with 6 (10%) patients more zeroes is removed
+cart_microRNA <- cart_mat[rowSums(cart_mat==0) < 6, ]
+dim(cart_microRNA)
+
+cart_microRNA <- as.data.frame(t(as.matrix(cart_microRNA)))
+cart_microRNA <- cart_microRNA[order(rownames(cart_microRNA)), ]
+```
+
+```{r}
+# Clinical variables
+clinic_cov <- read_xlsx("clinical_covariates.xlsx")
+dim(clinic_cov)
+# remove unused variables
+clinic_cov <- clinic_cov[, -c(16, 23:24, 26:30, 33:34)]
+clinic_cov <- as.data.frame(clinic_cov)
+colnames(clinic_cov) <- c("patient_id","sex",
+                    "age60","histology",
+                    "n_lines_preAferesi","pre_aferesi_status","bridge_infusion",
+                    "PET_BRIDGING","ECOG_PRELD","stage",
+                    "BULKY_PRELD","DLBCL_R_IPI_PRELD","MCL_MIPI_PRELD","CAR_T_type",
+                    "CAR_T_PRODUCT", "CRS","ICANS","ICANS_ricat","LDH_PRELD",
+                    "FERR_PRELD","PCR_PRELD","follow_3months", "os_status", "os_time", "pfs_status" ,"pfs_time" )
+clinic_cov$follow_3months <- as.numeric(clinic_cov$follow_3months)
+
+clinic_cov$patient_id <- patient_id(clinic_cov$patient_id)
+
+clinic_cov <- clinic_cov[order(clinic_cov$patient_id), ]
+# sex F = 1, M = 0
+clinic_cov$sex[clinic_cov$sex=="F"] <- "1"
+clinic_cov$sex[clinic_cov$sex=="M"] <- "0"
+# histology PMBCL = 0, LBCL = 1, MCL = 2
+clinic_cov$histology[clinic_cov$histology=="PMBCL"] <- "0"
+clinic_cov$histology[clinic_cov$histology=="LBCL"] <- "1"
+clinic_cov$histology[clinic_cov$histology=="MCL"] <- "2"
+clinic_cov$histology <- as.numeric(clinic_cov$histology)
+```
+
+# Overall survival
+```{r}
+os <- clinic_cov[clinic_cov$BULKY_PRELD!="ND",]
+os$follow_3months <- NULL
+os$pfs_status <- NULL
+os$pfs_time <- NULL
+
+os <- os[, -c(8,12:14)]
+os$ICANS <- NULL
+os$BULKY_PRELD <- as.numeric(os$BULKY_PRELD)
+
+cart_os_cox <- cart_microRNA[rownames(cart_microRNA) %in% os$patient_id, ]
+cart_os_cox <- cbind(os, cart_os_cox)
+
+cart_os_cox$fll3_cart <- paste(cart_os_cox$CAR_T_PRODUCT, cart_os_cox$os_status, sep = "_")
+cart_os_cox$fll3_cart[cart_os_cox$fll3_cart=="1_0"] <- "cart1_0"
+cart_os_cox$fll3_cart[cart_os_cox$fll3_cart=="0_0"] <- "cart0_0"
+cart_os_cox$fll3_cart[cart_os_cox$fll3_cart=="0_1"] <- "cart0_1"
+cart_os_cox$fll3_cart[cart_os_cox$fll3_cart=="1_1"] <- "cart1_1"
+```
+
+```{r}
+# Function for accuracy
+err_metric <- function(CM){
+  TN = CM[1,1]
+  TP = CM[2,2]
+  FP = CM[1,2]
+  FN = CM[2,1]
+  accuracy_meas <- (TP+TN)/(TP+TN+FP+FN)
+  accuracy_meas <- round(accuracy_meas, 2)
+}
+
+accuracy <- data.frame(accuracy=NA)
+discovery <- test <- train <- y_train <- valid <- cv_glmnet <- y_pred <- y_valid <- pred <- y  <- prognosis <- list()
+set.seed(333)
+inTrain <- createDataPartition(
+  y = cart_os_cox$fll3_cart,
+  p = .75,
+  list = FALSE
+)
+
+discovery <- cart_os_cox[inTrain,]
+test <- cart_os_cox[-inTrain,]
+
+n <- 100
+for (i in 1:n) {
+  inTrain <- createDataPartition(
+    y = discovery$fll3_cart,
+    p = .75,
+    list = FALSE
+  )
+  train[[i]] <- discovery[inTrain,]
+  train[[i]]$patient_id <- NULL
+  train[[i]]$fll3_cart <- NULL
+  
+  y_train[[i]] <- Surv(train[[i]]$os_time, train[[i]]$os_status)
+  train[[i]]$os_status <- NULL
+  train[[i]]$os_time <- NULL
+  
+  valid[[i]] <- discovery[-inTrain,]
+  valid[[i]]$patient_id <- NULL
+  valid[[i]]$fll3_cart <- NULL
+}
+
+for (i in seq_along(train)) {
+  set.seed(333)
+  foldid <- sample(rep(seq(5), length.out = nrow(train[[i]])))
+  cv_glmnet[[i]] <- cv.glmnet(as.matrix(train[[i]]), y_train[[i]], family = "cox", foldid = foldid, alpha = 0.3)
+  
+  y_valid[[i]] <- valid[[i]]$os_status
+  valid[[i]]$os_status <- NULL
+  valid[[i]]$os_time <- NULL
+  
+  pred[[i]] <- predict(cv_glmnet[[i]], newx = as.matrix(valid[[i]]), type = "link", s = "lambda.min")
+  pred[[i]] <- as.data.frame(pred[[i]])
+  prognosis[[i]] <- ifelse(pred[[i]] > 0,"0", "1")
+  y_pred <- prognosis[[i]]
+  colnames(y_pred) <- c("y_pred")
+  
+  accuracy[i,] <- err_metric(table(factor(y_valid[[i]], levels= 0:1), factor(y_pred, levels= 0:1)))
+}
+summary(accuracy$accuracy)
+table(accuracy$accuracy)
+
+accuracy$iter <- lapply(seq_along(train), function(i) paste("iter", i, sep = "_"))
+
+table(accuracy$accuracy)
+summary(accuracy$accuracy)
+
+hist(accuracy$accuracy, breaks = 20)
+
+n_coef <- data.frame(n_coef=NA)
+coef <- list()
+for(i in seq_along(cv_glmnet)){
+  coef[[i]] <- as.data.frame(as.matrix(coef(cv_glmnet[[i]], s ="lambda.min")))
+  coef[[i]]$var <- rownames(coef[[i]])
+  colnames(coef[[i]]) <- c("s1", "var")
+  coef[[i]] <- coef[[i]][coef[[i]]$s1>0, ]
+  coef[[i]] <- coef[[i]]$var
+  n_coef[i, ] <- length(coef[[i]])
+}
+n_coef$seq <- seq_along(cv_glmnet)
+n_coef <- n_coef[n_coef$n_coef>0,]
+coef <- coef[as.numeric(n_coef$seq)]
+
+var <- colnames(cart_os_cox[-c(17,18)])
+times <- lapply(var, function(x) grep(x, coef))
+names(times) <- var
+times <- lapply(times, function(x) 100*length(x)/length(seq_along(cv_glmnet)))
+
+df <- data.frame(times = sapply(times, c), var=var)
+df <- df[order(df$times, decreasing = TRUE),]
+df$type <- df$var
+df$type[grep("hsa", df$var)] <- "mirna"
+df$type[df$type!="mirna"] <- "clinic"
+
+df1 <- df[df$times>=10,]
+ggplot(df1, aes(x=reorder(var, times, decreasing = TRUE), y=times, fill=type)) + geom_col(width = 0.2, position = position_dodge(width = 0)) + ylim(0,100) + labs(x=NULL) + theme(axis.text.x = element_text(angle=90), text=element_text(size=15))
+```
+
+```{r}
+discovery_slc <- discovery[, c("os_time", "os_status", df1$var)]
+
+fit_cox <- coxph(Surv(os_time, os_status) ~. , data = discovery_slc)
+summary(fit_cox)  
+
+test$patient_id <- NULL
+pred <- survival:::predict.coxph(fit_cox, newdata = test, type = "expected")
+pred <- as.data.frame(pred)
+pred <- round(exp(-pred))
+
+y_pred <- pred$pred
+y_real <- test$os_status
+
+accuracy <- err_metric(table(factor(y_real, levels= 0:1), factor(y_pred, levels= 0:1)))
+accuracy
+```
+
+```{r}
+discovery_slc <- discovery[, c("os_time", "os_status", df1[1:6,]$var)]
+
+fit_cox1 <- coxph(Surv(os_time, os_status) ~. , data = discovery_slc)
+summary(fit_cox1)  
+
+test$patient_id <- NULL
+pred <- survival:::predict.coxph(fit_cox1, newdata = test, type = "expected")
+pred <- as.data.frame(pred)
+pred <- round(exp(-pred))
+
+y_pred <- pred$pred
+y_real <- test$os_status
+
+accuracy <- err_metric(table(factor(y_real, levels= 0:1), factor(y_pred, levels= 0:1)))
+accuracy
+
+anova(fit_cox, fit_cox1, test = "Chisq")
+```
+
+```{r}
+discovery_slc <- discovery[, c("os_time", "os_status", df1[1:4,]$var)]
+
+fit_cox2 <- coxph(Surv(os_time, os_status) ~. , data = discovery_slc)
+summary(fit_cox2)  
+
+test$patient_id <- NULL
+pred <- survival:::predict.coxph(fit_cox2, newdata = test, type = "expected")
+pred <- as.data.frame(pred)
+pred <- round(exp(-pred))
+
+y_pred <- pred$pred
+y_real <- test$os_status
+
+accuracy <- err_metric(table(factor(y_real, levels= 0:1), factor(y_pred, levels= 0:1)))
+accuracy
+
+anova(fit_cox1, fit_cox2, test = "Chisq")
+```
+
+
+```{r}
+save(discovery, test, train, valid, cv_glmnet, file = "cart_microRNA_os_cox_100000.RData")
+```
+
+```{r}
+sessionInfo()
+```

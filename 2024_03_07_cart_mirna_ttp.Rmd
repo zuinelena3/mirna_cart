@@ -1,0 +1,263 @@
+---
+title: "CAR-T microRNA - Time to progress"
+author: "Elena Zuin"
+date: "2024-03-15"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, error=FALSE, message=FALSE)
+```
+
+```{r}
+library(readxl)
+library(tidyr)
+library(glmnet)
+library(MASS)
+library(survminer)
+library(survival)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(survminer)
+library(caret)
+library(corrplot)
+library(tibble)
+
+# Modify patient ID
+patient_id <- function(pid) {
+  m <- str_match(pid, "^CAR-(\\d+)$")
+  n <- as.integer(m[,2])
+  ifelse(!is.na(n),
+         paste("CAR", n, sep = "-"),
+         NA_character_)
+}
+
+# load miRNA normalized expression
+cart_mat <- read_xlsx("CAR_T_microRNA_expr_matrix.xlsx",
+               sheet = "Normalizedcounts_deseq2"
+               #sheet = "Raw_data"
+)
+cart_mat$miRNA <- gsub("-", "_", cart_mat$miRNA)
+cart_mat$miRNA <- gsub("/", "_", cart_mat$miRNA)
+
+cart_id <- patient_id(colnames(cart_mat))
+cart_id <- c(colnames(cart_mat)[1], cart_id[-1])
+colnames(cart_mat) <- cart_id
+
+cart_mat <- as.data.frame(cart_mat)
+rownames(cart_mat) <- cart_mat$miRNA
+cart_mat$miRNA <- NULL
+
+# micro-RNA filtering
+# Every microRNA with 6 (10%) patients more zeroes is removed
+cart_microRNA <- cart_mat[rowSums(cart_mat==0) < 6, ]
+dim(cart_microRNA)
+
+cart_microRNA <- as.data.frame(t(as.matrix(cart_microRNA)))
+cart_microRNA <- cart_microRNA[order(rownames(cart_microRNA)), ]
+```
+
+```{r}
+# Clinical variables
+clinic_cov <- read_xlsx("clinical_covariates.xlsx")
+dim(clinic_cov)
+# remove unused variables
+clinic_cov <- clinic_cov[, -c(16, 23:32, 35:36)]
+clinic_cov <- as.data.frame(clinic_cov)
+colnames(clinic_cov) <- c("patient_id","sex",
+                    "age60","histology",
+                    "n_lines_preAferesi","pre_aferesi_status","bridge_infusion",
+                    "PET_BRIDGING","ECOG_PRELD","stage",
+                    "BULKY_PRELD","DLBCL_R_IPI_PRELD","MCL_MIPI_PRELD","CAR_T_type",
+                    "CAR_T_PRODUCT", "CRS","ICANS","ICANS_ricat","LDH_PRELD",
+                    "FERR_PRELD","PCR_PRELD", "ttp_status", "ttp_time")
+
+clinic_cov$ttp_time[clinic_cov$ttp_status == "NA"] <- max(clinic_cov$ttp_time)
+clinic_cov$ttp_status[clinic_cov$ttp_status == "NA"] <- "0"
+clinic_cov$ttp_status <- as.numeric(clinic_cov$ttp_status)
+# clinic_cov$ttp_time[clinic_cov$ttp_status == "0"] <- max(clinic_cov$ttp_time)
+
+hist(clinic_cov$ttp_time, breaks = 20)
+clinic_cov$patient_id <- patient_id(clinic_cov$patient_id)
+
+clinic_cov <- clinic_cov[order(clinic_cov$patient_id), ]
+# sex F = 1, M = 0
+clinic_cov$sex[clinic_cov$sex=="F"] <- "1"
+clinic_cov$sex[clinic_cov$sex=="M"] <- "0"
+# histology PMBCL = 0, LBCL = 1, MCL = 2
+clinic_cov$histology[clinic_cov$histology=="PMBCL"] <- "0"
+clinic_cov$histology[clinic_cov$histology=="LBCL"] <- "1"
+clinic_cov$histology[clinic_cov$histology=="MCL"] <- "2"
+clinic_cov$histology <- as.numeric(clinic_cov$histology)
+clinic_cov$ICANS <- NULL
+clinic_cov$CAR_T_type <- NULL
+clinic_cov$DLBCL_R_IPI_PRELD <- clinic_cov$MCL_MIPI_PRELD <- clinic_cov$PET_BRIDGING <- NULL
+clinic_cov <- clinic_cov[clinic_cov$BULKY_PRELD!="ND",]
+
+cart_ttp_cox <- cart_microRNA[rownames(cart_microRNA) %in% clinic_cov$patient_id, ]
+cart_ttp_cox <- cbind(clinic_cov, cart_ttp_cox)
+
+cart_ttp_cox$split <- paste(cart_ttp_cox$CAR_T_PRODUCT, cart_ttp_cox$ttp_status, sep = "_")
+cart_ttp_cox$split[cart_ttp_cox$split=="1_0"] <- "cart1_0"
+cart_ttp_cox$split[cart_ttp_cox$split=="0_0"] <- "cart0_0"
+cart_ttp_cox$split[cart_ttp_cox$split=="0_1"] <- "cart0_1"
+cart_ttp_cox$split[cart_ttp_cox$split=="1_1"] <- "cart1_1"
+```
+
+# Cox
+
+```{r}
+split <- function(data) {
+  inTrain <- createDataPartition(y = data$split, p = .75, list = FALSE)
+  ll <- list(discovery = data[inTrain, ], test = data[-inTrain, ])
+  return(ll)
+}
+
+train_valid <- function(discovery){ 
+  inTrain <- createDataPartition(y = discovery$split, p = .75, list = FALSE)
+  train <- discovery[inTrain, ]
+  train$patient_id <- NULL
+  train$split <- NULL
+  
+  train_surv <- Surv(train$ttp_time, train$ttp_status)
+  train$ttp_status <- NULL
+  train$ttp_time <- NULL
+
+  valid <- discovery[-inTrain,]
+  valid$patient_id <- NULL
+  valid$split <- NULL
+  
+  ll <- list(train = train, train_surv = train_surv, valid = valid)
+  return(ll)
+}
+
+set.seed(333)
+split1 <- split(cart_ttp_cox)
+discovery <- split1$discovery
+test <- split1$test
+
+n <- 100000
+split2 <- replicate(n, train_valid(discovery), simplify = FALSE)
+train1 <- lapply(1:n, function(i) split2[[i]][[1]])
+valid1 <- lapply(1:n, function(i) split2[[i]][[3]])
+train_surv <- lapply(1:n, function(i) split2[[i]][[2]])
+```
+
+```{r}
+set.seed(333)
+foldid <- sample(rep(seq(5), length.out = nrow(train1[[1]])))
+elastic_net <- function(train, train_surv, foldid) {
+  cv <- cv.glmnet(as.matrix(train), train_surv, family =  "cox", foldid = foldid, alpha = 0.3)
+  return(cv)
+}
+
+cv_glmnet1 <- lapply(1:n, function(i)  elastic_net(train1[[i]], train_surv[[i]], foldid))
+
+accuracy_dist <- function(cv_glmnet, valid) {
+  y_real <- valid$ttp_status
+  valid$ttp_status <- NULL
+  valid$ttp_time <- NULL
+  
+  pred <- predict(cv_glmnet, newx = as.matrix(valid), type = "link", s = "lambda.min")
+  pred <- as.data.frame(pred)
+  y_pred <- ifelse(pred > 0, "0", "1")
+  colnames(y_pred) <- c("y_pred")
+
+  tab <- table(factor(y_real, levels= 0:1), factor(y_pred, levels = 0:1))
+  accuracy <- (tab[1, 1] + tab[2, 2]) / (tab[1, 1] + tab[2, 2] + tab[1, 2] + tab[2, 1]) 
+  return(accuracy)
+}
+
+valid_accuracy <- lapply(1:n, function(i) accuracy_dist(cv_glmnet1[[i]], valid1[[i]]))
+
+hist(do.call(rbind, valid_accuracy), breaks = 20)
+
+```
+
+```{r}
+coef_ll <- function(cv_glmnet) {
+  coef <- as.data.frame(as.matrix(coef(cv_glmnet, s = "lambda.min")))
+  coef$var <- rownames(coef)
+  coef <- coef[abs(coef$`1`) > 0, ]
+  coef <- data.frame(var = coef$var)
+  return(coef)
+}
+
+df <- as.data.frame(do.call(rbind, lapply(cv_glmnet1, function(x) coef_ll(x))))
+df <- as.data.frame(table(df))
+df <- df[order(df$Freq, decreasing = TRUE ), ]
+colnames(df) <- c("var", "times")
+df$freq <- 100*round(df$times/n, 2)
+df$type <- as.character(df$var)
+df$type[grep("hsa", df$var)] <- "mirna"
+df$type[df$type != "mirna"] <- "clinic"
+df <- df[df$freq>=10,]
+
+ggplot(df, aes(x=reorder(var, freq, decreasing = TRUE), y=freq, fill=type)) + geom_col(width = 0.2, position = position_dodge(width = 0)) + ylim(0,100) + labs(x=NULL) + theme(axis.text.x = element_text(angle=90), text=element_text(size=5))
+
+ggplot(df[df$freq>=20,], aes(x=reorder(var, freq, decreasing = TRUE), y=freq, fill=type)) + geom_col(width = 0.2, position = position_dodge(width = 0)) + ylim(0,100) + labs(x=NULL) + theme(axis.text.x = element_text(angle=90), text=element_text(size=15))
+
+```
+
+```{r, eval=FALSE}
+load("results_ttp.RData")
+
+discovery_slc <- discovery[, c("ttp_time", "ttp_status", as.character(df$var))]
+
+fit_cox <- coxph(Surv(ttp_time, ttp_status) ~. , data = discovery_slc)
+summary(fit_cox)  
+
+test$patient_id <- NULL
+pred <- survival:::predict.coxph(fit_cox, newdata = test, type = "expected")
+pred <- as.data.frame(pred)
+pred <- round(exp(-pred))
+  
+y_pred <- pred$pred
+y_real <- test$ttp_status
+
+tab <- table(factor(y_real, levels= 0:1), factor(y_pred, levels= 0:1))
+accuracy <- (tab[1, 1] + tab[2, 2]) / (tab[1, 1] + tab[2, 2] + tab[1, 2] + tab[2, 1]) 
+accuracy
+
+discovery_slc <- discovery[, c("ttp_time", "ttp_status", as.character(df[1:10,]$var))]
+
+fit_cox1 <- coxph(Surv(ttp_time, ttp_status) ~. , data = discovery_slc)
+summary(fit_cox1)  
+
+test$patient_id <- NULL
+pred <- survival:::predict.coxph(fit_cox1, newdata = test, type= "expected")
+pred <- as.data.frame(pred)
+pred <- round(exp(-pred))
+  
+y_pred <- pred$pred
+y_real <- test$ttp_status
+
+tab <- table(factor(y_real, levels= 0:1), factor(y_pred, levels= 0:1))
+accuracy <- (tab[1, 1] + tab[2, 2]) / (tab[1, 1] + tab[2, 2] + tab[1, 2] + tab[2, 1]) 
+accuracy
+
+discovery_slc <- discovery[, c("ttp_time", "ttp_status", as.character(df[1:5,]$var))]
+
+fit_cox2 <- coxph(Surv(ttp_time, ttp_status) ~. , data = discovery_slc)
+summary(fit_cox2)  
+
+test$patient_id <- NULL
+pred <- survival:::predict.coxph(fit_cox2, newdata = test, type= "expected")
+pred <- as.data.frame(pred)
+pred <- round(exp(-pred))
+  
+y_pred <- pred$pred
+y_real <- test$ttp_status
+
+tab <- table(factor(y_real, levels= 0:1), factor(y_pred, levels= 0:1))
+accuracy <- (tab[1, 1] + tab[2, 2]) / (tab[1, 1] + tab[2, 2] + tab[1, 2] + tab[2, 1]) 
+accuracy
+
+```
+
+
+```{r}
+save(discovery, test, train1, valid1, cv_glmnet1, df, file = "cart_microRNA_ttp_100000.RData")
+save(discovery, test, df, file = "results_ttp.RData")
+```
