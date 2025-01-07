@@ -1,0 +1,168 @@
+---
+title: "12M-FUP model"
+author: "Elena Zuin"
+date: "2025-01-07"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(tidyr)
+library(glmnet)
+library(MASS)
+library(survminer)
+library(survival)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(survminer)
+library(caret)
+library(corrplot)
+library(tibble)
+```
+
+```{r}
+# Modify patient ID
+patient_id <- function(pid) {
+  m <- str_match(pid, "^CAR-(\\d+)$")
+  n <- as.integer(m[,2])
+  ifelse(!is.na(n),
+         paste("CAR", n, sep = "-"),
+         NA_character_)
+}
+setwd("~/Documents/Other_project/CART_microRNA")
+cart_mat <- read_xlsx("data/filtered_mirna.xlsx")
+cart_mat <- as.data.frame(t(as.matrix(cart_mat)))
+colnames(cart_mat) <- cart_mat[1, ]
+cart_mat <- cart_mat[-1, ]
+cart_mat <- cart_mat[order(rownames(cart_mat)), ]
+
+data <- readxl::read_xlsx(path = "data/cart_updated_clinical_covariates.xlsx")
+data <- data[!is.na(data$OUTCOME_12M__PDSD1), ]
+data <- data[, -c(30:36, 38:43)]
+
+data$ID <- patient_id(data$ID)
+data <- data[order(data$ID), ]
+# sex F = 1, M = 0
+data$SEX[data$SEX=="F"] <- "1"
+data$SEX[data$SEX=="M"] <- "0"
+# histology PMBCL = 0, LBCL = 1, MCL = 2
+data$AF_ISTOLOGIA[data$AF_ISTOLOGIA=="PMBCL"] <- "0"
+data$AF_ISTOLOGIA[data$AF_ISTOLOGIA=="LBCL"] <- "1"
+data$AF_ISTOLOGIA[data$AF_ISTOLOGIA=="MCL"] <- "2"
+data$AF_ISTOLOGIA <- as.numeric(data$AF_ISTOLOGIA)
+
+is_na <- data[ , apply(data, 2, function(x) any(is.na(x)))]
+is_na <- as.data.frame(is_na)
+is_na <- is_na[, apply(is_na, 2, function(x) sum(is.na(x)) <= 1)]
+is_na <- is_na[, 4:6]
+
+data <- data[ , apply(data, 2, function(x) !any(is.na(x)))]
+data <- cbind(data, is_na)
+data <- data[-26, -c(3, 8, 14, 18,21)]
+
+# Follow up 12 months 
+cart_mat <- cart_mat[rownames(cart_mat) %in% data$ID, ]
+
+data <- cbind(data, cart_mat)
+data$selection <- paste(data$PRODOTTO, data$OUTCOME_12M__PDSD1, sep = "_")
+data$PRODOTTO[data$PRODOTTO == "Axicel"] <- "0"
+data$PRODOTTO[data$PRODOTTO == "Tisacel"] <- "1"
+data$PRODOTTO <- as.numeric(data$PRODOTTO)
+
+data$PRELD_HEMATOTOX_LOW01_HIGH2[data$PRELD_HEMATOTOX_LOW01_HIGH2=="HIGH >= 2"] <- "2"
+data$PRELD_HEMATOTOX_LOW01_HIGH2[data$PRELD_HEMATOTOX_LOW01_HIGH2=="LOW 0-1"] <- "1"
+data$PRELD_HEMATOTOX_LOW01_HIGH2 <- as.numeric(data$PRELD_HEMATOTOX_LOW01_HIGH2)
+```
+
+# Train/Validation/Test sets
+
+```{r}
+split <- function(data) {
+  inTrain <- createDataPartition(y = data$selection, p = .75, list = FALSE)
+  ll <- list(discovery = data[inTrain, ], test = data[-inTrain, ])
+  return(ll)
+}
+
+train_valid <- function(discovery){ 
+  inTrain <- createDataPartition(y = discovery$selection, p = .75, list = FALSE)
+  train <- discovery[inTrain, ]
+  train$ID <- NULL
+  train$selection <- NULL
+  
+  valid <- discovery[-inTrain,]
+  valid$ID <- NULL
+  valid$selection <- NULL
+  
+  ll <- list(train = train, valid = valid)
+  return(ll)
+}
+
+set.seed(333)
+split1 <- split(data)
+
+split2 <- replicate(100000, train_valid(split1$discovery), simplify = FALSE)
+train <- lapply(1:100000, function(i) split2[[i]][[1]])
+valid <- lapply(1:100000, function(i) split2[[i]][[2]])
+```
+
+# Elastic net
+
+```{r}
+set.seed(333)
+foldid <- sample(rep(seq(5), length.out = nrow(train[[1]][,-21])))
+elastic_net <- function(train, foldid) {
+  cv <- cv.glmnet(as.matrix(train[, -21]), train[, 21], family =  "binomial", foldid = foldid, alpha = 0.3)
+  return(cv)
+}
+
+cv_glmnet <- lapply(train, function(x) elastic_net(x, foldid))
+
+accuracy_dist <- function(cv_glmnet, valid) {
+  pred <- as.data.frame(predict(cv_glmnet, newx = as.matrix(valid[, -21]), type = "response", s = "lambda.min"))
+  pred$lambda.min[pred$lambda.min >= 0.5] <- 1
+  pred$lambda.min[pred$lambda.min < 0.5] <- 0
+  
+  y_real <- valid$OUTCOME_12M__PDSD1
+  y_pred <- pred$lambda.min
+  
+  tab <- table(factor(y_real, levels= 0:1), factor(y_pred, levels= 0:1))
+  accuracy <- (tab[1, 1] + tab[2, 2]) / (tab[1, 1] + tab[2, 2] + tab[1, 2] + tab[2, 1]) 
+  return(accuracy)
+}
+
+valid_accuracy <- mapply(function(x, y) accuracy_dist(cv_glmnet = x, y),
+                         cv_glmnet, valid)
+summary(valid_accuracy)
+hist(valid_accuracy)
+
+coef_ll <- function(cv_glmnet) {
+  coef <- as.data.frame(as.matrix(coef(cv_glmnet, s = "lambda.min")))
+  coef$var <- rownames(coef)
+  coef <- coef[abs(coef$s1) > 0, ]
+  coef <- coef[-1, ]
+  coef <- as.data.frame(coef$var)
+  return(coef)
+}
+df <- as.data.frame(do.call(rbind, lapply(cv_glmnet, function(x) coef_ll(x))))
+df <- as.data.frame(table(df))
+df <- df[order(df$Freq, decreasing = TRUE ), ]
+colnames(df) <- c("var", "times")
+df$freq <- 100*round(df$times/length(cv_glmnet), 2)
+df$type <- as.character(df$var)
+df$type[grep("hsa", df$var)] <- "mirna"
+df$type[df$type != "mirna"] <- "clinic"
+df <- df[df$freq >= 10,]
+
+ggplot(df, aes(x=reorder(var, freq, decreasing = TRUE), y=freq, fill=type)) + 
+  geom_col(width = 0.2, position = position_dodge(width = 0)) + ylim(0,100) + labs(x=NULL) + theme_classic() +
+  theme(axis.text.x = element_text(angle=90), text=element_text(size=10))
+```
+
+```{r}
+save(cv_glmnet, split1, split2, file = "cart_mirna_12mfup_100000.RData")
+```
