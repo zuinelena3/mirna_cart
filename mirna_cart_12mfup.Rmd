@@ -1,0 +1,270 @@
+---
+title: "12M-FUP model"
+author: "Elena Zuin"
+date: "2025-04-15"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+library(readxl)
+library(plyr)
+library(stringr)
+library(caret)
+library(glmnet)
+library(parallel)
+library(ggplot2)
+```
+
+```{r}
+patient_id <- function(pid) {
+  m <- str_match(pid, "^CAR-(\\d+)$")
+  n <- as.integer(m[,2])
+  ifelse(!is.na(n),
+         paste("CAR", n, sep = "-"),
+         NA_character_)
+}
+```
+
+# Data
+
+## Clinical variables
+
+```{r}
+cl_var <- readxl::read_xlsx(path = "data/metadata_updated.xlsx")
+cl_var <- cl_var[!is.na(cl_var$Outcome12m_PD1), ]
+cl_var$Outcome3m_PDSD1 <- NULL
+cl_var$LineePre <- NULL
+cl_var$ToxCRS_maxGrade <- NULL
+cl_var$ToxICANS_maxGrade <- NULL
+
+cl_var$ID <- patient_id(cl_var$ID)
+
+cl_var$Prodotto <- revalue(cl_var$Prodotto, c("Axicel" = "1", "Tisacel" = "0"))
+cl_var$Sex <- revalue(cl_var$Sex, c("M" = "1", "F" = "0"))
+
+cl_var$Istologia <- revalue(cl_var$Sex, c("DLBCL" = "1", "HGBCL" = "1", "PMBCL" = "0"))
+cl_var <- cl_var[order(cl_var$ID), ]
+
+cl_var <- cl_var[, -c(20, 22)]
+```
+
+## miRNA
+
+```{r}
+mirna_mat <- read_xlsx("data/filtered_mirna.xlsx")
+mirna_mat <- as.data.frame(t(as.matrix(mirna_mat)))
+colnames(mirna_mat) <- mirna_mat[1, ]
+mirna_mat <- mirna_mat[-1, ]
+mirna_mat <- mirna_mat[order(rownames(mirna_mat)), ]
+mirna_mat <- mirna_mat[rownames(mirna_mat) %in% cl_var$ID, ]
+```
+
+# Selection
+
+```{r}
+data <- cbind(cl_var, mirna_mat)
+data$selection <- paste(data$Prodotto, data$Outcome12m_PD1, sep = "_")
+```
+
+## Discovery/Test selection
+
+```{r split1}
+split <- function(data) {
+  inTrain <- createDataPartition(y = data$selection, p = .75, list = FALSE)
+  ll <- list(discovery = data[inTrain, ], test = data[-inTrain, ])
+  return(ll)
+}
+
+set.seed(333)
+split1 <- split(data)
+```
+
+## Train/Validation selection
+
+```{r train}
+train_valid <- function(discovery){ 
+  inTrain <- createDataPartition(y = discovery$selection, p = .75, list = FALSE)
+  train <- discovery[inTrain, ]
+  train$ID <- train$selection <- NULL
+
+  valid <- discovery[-inTrain,]
+  valid$ID <- valid$selection <- NULL
+  
+  ll <- list(train = train, valid = valid)
+  return(ll)
+}
+
+set.seed(333)
+split2 <- replicate(1000, train_valid(split1$discovery), simplify = FALSE)
+train <- lapply(1:1000, function(i) split2[[i]][[1]])
+valid <- lapply(1:1000, function(i) split2[[i]][[2]])
+```
+
+## Lasso
+
+```{r pred}
+slc_var <- function(model, lambda){
+  coef <- as.data.frame(as.matrix(coef(model, s = lambda)))
+  coef$var <- rownames(coef)
+  coef <- coef[abs(coef$s1) > 0, ]
+  coef <- coef[-1, ]
+  coef <- coef$var
+  return(coef)
+}
+
+accuracy <- function(y_real, y_pred){
+  tab <- table(factor(y_real, levels= 0:1), factor(y_pred, levels= 0:1))
+  res <- (tab[1, 1] + tab[2, 2]) / (tab[1, 1] + tab[2, 2] + tab[1, 2] + tab[2, 1]) 
+  return(res)
+}
+
+prediction <- function(lambda){
+  fit <- lapply(train, function(x) glmnet(as.matrix(x[, -18]), x[, 18], family = "binomial", alpha = 1,
+                                          lambda = lambda))
+  var <- lapply(fit, function(x) slc_var(x, lambda))
+  pred <- lapply(1:length(valid), function(i) as.data.frame(predict(fit[[i]], newx = as.matrix(valid[[i]][, -18]),
+                                                                         type = "response", s = lambda)))
+  pred <- lapply(pred, function(x) ifelse(x$s1 >= 0.5, 1, 0))
+  
+  y_real <- lapply(valid, function(x) x$Outcome12m_PD1)
+  y_pred <- lapply(pred, function(x) x)
+  
+  res <- sapply(1:length(y_pred), function(i) accuracy(y_real = y_real[[i]], y_pred = y_pred[[i]]))
+  mean <- mean(res)
+  return(list(var = var, mean = mean))
+}
+
+set.seed(333)
+lambda <- seq(0.001, 1, length = 100)
+results <- mclapply(lambda, prediction, mc.cores = 8)
+```
+
+```{r}
+mean <- sapply(results, function(x) x$mean)
+names(mean) <- lambda
+plot(mean)
+```
+
+```{r}
+save(results, split1, file = "2025_04_15_cart_12mfup.RData")
+```
+
+```{r}
+variables <- lapply(results, function(x) x$var)
+names(variables) <- lambda
+
+opt_lambda <- lambda[match(max(mean), mean)]
+var_opt <- variables[[match(max(mean), mean)]]
+
+len <- sapply(var_opt, function(x) length(x))
+freq_opt <- do.call(rbind, lapply(var_opt, function(x) data.frame(var = x)))
+freq_opt <- as.data.frame(table(freq_opt$var))
+freq_opt$Freq <- 100*freq_opt$Freq/length(len)
+
+freq_opt$type <- as.character(freq_opt$Var1)
+freq_opt$type[grep("hsa", freq_opt$type)] <- "mirna"
+freq_opt$type[freq_opt$type != "mirna"] <- "clinic"
+
+freq_opt <- freq_opt[order(freq_opt$Freq, decreasing = T), ]
+
+ggplot(freq_opt, aes(x=reorder(Var1, Freq, decreasing = TRUE), y=Freq, fill=type)) +
+  geom_col(width = 0.2, position = position_dodge(width = 0)) + ylim(0,100) + labs(x=NULL) + theme_classic() +
+  theme(axis.text.x = element_text(angle=90), text=element_text(size=10))
+```
+
+# Final model
+
+```{r}
+discovery <- split1$discovery
+discovery <- mapply(discovery, FUN=as.numeric)
+test <- split1$test
+test$ID <- test$selection <- NULL
+y_real <- test$Outcome12m_PD1
+test <- mapply(test, FUN=as.numeric)
+
+freq_opt$Var1 <- as.character(freq_opt$Var1)
+```
+
+```{r}
+select_model <- function(n_var){
+  if(n_var == 0){
+    fit <- glm(Outcome12m_PD1 ~., data = data.frame(Outcome12m_PD1 = discovery[, c("Outcome12m_PD1")]),
+               family = "binomial")
+  }
+  else {
+    fit <- glm(Outcome12m_PD1 ~., data = as.data.frame(discovery[, c("Outcome12m_PD1", freq_opt$Var1[1:n_var])]),
+               family = "binomial")
+  }
+  
+  pred <- round(predict(fit, newdata = as.data.frame(test[, -c(18)]), type = "response"))
+  out <- accuracy(y_real = y_real, y_pred = pred)
+  return(list(fit = fit, accuracy = out))
+}
+```
+
+```{r}
+fit <- lapply(0:5, function(i) select_model(i))
+```
+
+
+```{r}
+n_var <- length(fit)-1
+anova <- list()
+pair <- numeric(0)
+ind <- 0
+for (i in 1:n_var) {
+  ind <- ind +1
+  pair[ind] <- paste(i-1, i, sep = "_")
+  anova[[ind]] <- anova(fit[[i]]$fit, fit[[i+1]]$fit)
+}
+names(anova) <- pair
+```
+
+```{r}
+fit0 <- glm(Outcome12m_PD1 ~., data = data.frame(Outcome12m_PD1 = discovery[, c("Outcome12m_PD1")]),
+            family = "binomial")
+summary(fit0)
+pred0 <- round(predict(fit0, newdata = as.data.frame(test[,-c(21)]), type = "response"))
+accuracy(y_real = y_real, y_pred = pred0)
+
+fit1 <- glm(Outcome12m_PD1 ~., data = as.data.frame(discovery[, c("Outcome12m_PD1", freq_opt$Var1[1])]),
+            family = "binomial")
+summary(fit1)
+pred1 <- round(predict(fit1, newdata = as.data.frame(test[,-c(21)]), type = "response"))
+accuracy(y_real = y_real, y_pred = pred1)
+
+anova(fit0, fit1)
+
+fit2 <- glm(Outcome12m_PD1 ~., data = as.data.frame(discovery[, c("Outcome12m_PD1", freq_opt$Var1[1:2])]),
+            family = "binomial")
+summary(fit2)
+pred2 <- round(predict(fit2, newdata = as.data.frame(test[,-c(21)]), type = "response"))
+accuracy(y_real = y_real, y_pred = pred2)
+
+anova(fit1, fit2)
+
+fit3 <- glm(Outcome12m_PD1 ~., data = as.data.frame(discovery[, c("Outcome12m_PD1", freq_opt$Var1[1:3])]),
+            family = "binomial")
+summary(fit3)
+pred3 <- round(predict(fit3, newdata = as.data.frame(test[,-c(21)]), type = "response"))
+accuracy(y_real = y_real, y_pred = pred3)
+
+anova(fit2, fit3)
+
+fit4 <- glm(Outcome12m_PD1 ~., data = as.data.frame(discovery[, c("Outcome12m_PD1", freq_opt$Var1[1:4])]),
+            family = "binomial")
+summary(fit4)
+pred4 <- round(predict(fit4, newdata = as.data.frame(test[,-c(21)]), type = "response"))
+accuracy(y_real = y_real, y_pred = pred4)
+
+anova(fit3, fit4)
+```
+
+```{r}
+sessionInfo()
+```
+
